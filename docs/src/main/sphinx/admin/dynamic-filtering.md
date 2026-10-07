@@ -226,6 +226,44 @@ especially when a range of values is selected from the build side of the join.
 The limits for min-max filters collection are defined by the properties
 based on `range-row-limit-per-driver`.
 
+## Bloom filters for large dynamic filters
+
+A min-max filter only excludes probe side values outside the range of the build side,
+so a build side with a wide range of join keys filters little. A bloom filter keeps a
+compact, approximate membership summary of all the collected values instead, and is
+collected in addition to the min-max filter when the build side exceeds the distinct
+values thresholds.
+
+Bloom filter collection is disabled by default and is enabled with the
+`dynamic-filtering.bloom-filter.enabled` configuration property, or the
+`dynamic_filtering_bloom_filter_enabled` session property. Its fixed memory footprint
+is determined by `dynamic-filtering.bloom-filter.expected-distinct-values`
+(1000000 by default) and `dynamic-filtering.bloom-filter.false-positive-probability`
+(0.05 by default), and is about 760 kB with those defaults. Because that footprint does
+not shrink, a bloom filter which does not fit in `dynamic-filtering.max-size-per-filter`
+is discarded and the dynamic filter degrades to a min-max filter as it does without this
+feature. Both sizing properties must be configured identically on every node, otherwise
+the filters collected by different nodes cannot be merged and are discarded.
+
+A bloom filter is only collected for a dynamic filter whose probe side table scans are
+all served by connectors declaring an implementation they can read. A connector declares
+its supported implementations with
+`Connector.getSupportedDynamicFilterBloomFilterKinds()`, and reads the collected filter
+from `Domain.getBloomFilter()`. Connectors which do not implement that method are
+unaffected and keep using the min-max filter. The engine can only determine the
+consuming connector when the probe side table scan is planned in the same stage as the
+join, which is always the case for broadcast joins.
+
+Unlike min-max filters, bloom filters are also collected for `DOUBLE` and `REAL` join keys.
+
+The engine can also use a collected bloom filter itself, to discard rows in the scan operator before they
+reach the join. That is enabled separately with the `dynamic-row-filtering.bloom-filter.enabled`
+configuration property, or the `dynamic_row_filtering_bloom_filter_enabled` session property, and requires
+`enable-dynamic-row-filtering` and bloom filter collection to be enabled as well. It applies to every
+connector, so when it is enabled a bloom filter is collected even if no connector declared support for one.
+The bloom filter is applied as a separate condition from the min-max range collected for the same column, so
+the selectivity threshold described above disables the two independently.
+
 ## Dimension tables layout
 
 Dynamic filtering works best for dimension tables where
@@ -241,6 +279,8 @@ of selected rows from the dimension table.
 ## Limitations
 
 - Min-max dynamic filter collection is not supported for `DOUBLE`, `REAL` and unorderable data types.
+- Bloom filter dynamic filter collection is not supported for unorderable data types, and only takes
+  place for connectors which declare a bloom filter implementation they can read.
 - Dynamic filtering is not supported for `DOUBLE` and `REAL` data types when using `IS NOT DISTINCT FROM` predicate.
 - Dynamic filtering is supported when the join key contains a cast from the build key type to the
   probe key type. Dynamic filtering is also supported in limited scenarios when there is an implicit

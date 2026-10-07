@@ -14,6 +14,7 @@
 package io.trino.spi.predicate;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import io.trino.spi.type.Type;
 
@@ -22,6 +23,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
+import static com.fasterxml.jackson.annotation.JsonInclude.Include.NON_ABSENT;
 import static io.airlift.slice.SizeOf.instanceSize;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
@@ -45,19 +47,37 @@ public final class Domain
 
     private final ValueSet values;
     private final boolean nullAllowed;
+    private final Optional<BloomFilter> bloomFilter;
 
     private Domain(ValueSet values, boolean nullAllowed)
     {
-        this.values = requireNonNull(values, "values is null");
-        this.nullAllowed = nullAllowed;
+        this(values, nullAllowed, Optional.empty());
     }
 
+    private Domain(ValueSet values, boolean nullAllowed, Optional<BloomFilter> bloomFilter)
+    {
+        this.values = requireNonNull(values, "values is null");
+        this.nullAllowed = nullAllowed;
+        this.bloomFilter = requireNonNull(bloomFilter, "bloomFilter is null");
+    }
+
+    public static Domain create(ValueSet values, boolean nullAllowed)
+    {
+        return new Domain(values, nullAllowed, Optional.empty());
+    }
+
+    /**
+     * Creates a domain which, in addition to {@code values}, carries an approximate membership filter over the
+     * non-null values of the column. The filter is a superset of the values of the column, so consumers which
+     * do not understand its {@link BloomFilter#kind()} can safely ignore it and use {@code values} alone.
+     */
     @JsonCreator
     public static Domain create(
             @JsonProperty("values") ValueSet values,
-            @JsonProperty("nullAllowed") boolean nullAllowed)
+            @JsonProperty("nullAllowed") boolean nullAllowed,
+            @JsonProperty("bloomFilter") Optional<BloomFilter> bloomFilter)
     {
-        return new Domain(values, nullAllowed);
+        return new Domain(values, nullAllowed, bloomFilter);
     }
 
     public static Domain none(Type type)
@@ -121,6 +141,18 @@ public final class Domain
     public boolean isNullAllowed()
     {
         return nullAllowed;
+    }
+
+    /**
+     * An optional approximate membership filter over the non-null values of the column, in addition to
+     * {@link #getValues()}. It never reports a false negative, so a value rejected by the filter is certainly
+     * not in the domain, while a value accepted by it may still be absent.
+     */
+    @JsonProperty
+    @JsonInclude(NON_ABSENT)
+    public Optional<BloomFilter> getBloomFilter()
+    {
+        return bloomFilter;
     }
 
     public boolean isNone()
@@ -213,13 +245,14 @@ public final class Domain
     public Domain intersect(Domain other)
     {
         checkCompatibility(other);
-        return new Domain(values.intersect(other.getValues()), this.isNullAllowed() && other.isNullAllowed());
+        // the intersection is a subset of this domain, so this bloom filter remains a superset of the result
+        return new Domain(values.intersect(other.getValues()), this.isNullAllowed() && other.isNullAllowed(), bloomFilter.or(() -> other.bloomFilter));
     }
 
     public Domain union(Domain other)
     {
         checkCompatibility(other);
-        return new Domain(values.union(other.getValues()), this.isNullAllowed() || other.isNullAllowed());
+        return new Domain(values.union(other.getValues()), this.isNullAllowed() || other.isNullAllowed(), unionBloomFilters(List.of(this, other)));
     }
 
     public static Domain union(List<Domain> domains)
@@ -240,18 +273,62 @@ public final class Domain
 
         ValueSet unionedValues = valueSets.get(0).union(valueSets.subList(1, valueSets.size()));
 
-        return new Domain(unionedValues, nullAllowed);
+        return new Domain(unionedValues, nullAllowed, unionBloomFilters(domains));
     }
 
     public Domain complement()
     {
+        // the complement of a superset is not a superset of the complement, so the bloom filter is dropped
         return new Domain(values.complement(), !nullAllowed);
     }
 
     public Domain subtract(Domain other)
     {
         checkCompatibility(other);
-        return new Domain(values.subtract(other.getValues()), this.isNullAllowed() && !other.isNullAllowed());
+        // the difference is a subset of this domain, so this bloom filter remains a superset of the result
+        return new Domain(values.subtract(other.getValues()), this.isNullAllowed() && !other.isNullAllowed(), bloomFilter);
+    }
+
+    /**
+     * Merges the bloom filters of {@code domains} into a filter which is a superset of their union, or returns
+     * empty when a domain contributes values which cannot be added to a filter.
+     */
+    private static Optional<BloomFilter> unionBloomFilters(List<Domain> domains)
+    {
+        int firstWithFilter = -1;
+        for (int i = 0; i < domains.size(); i++) {
+            if (domains.get(i).bloomFilter.isPresent()) {
+                firstWithFilter = i;
+                break;
+            }
+        }
+        if (firstWithFilter < 0) {
+            return Optional.empty();
+        }
+
+        Optional<BloomFilter> result = domains.get(firstWithFilter).bloomFilter;
+        for (int i = 0; i < domains.size() && result.isPresent(); i++) {
+            if (i != firstWithFilter) {
+                result = mergeBloomFilter(result.get(), domains.get(i));
+            }
+        }
+        return result;
+    }
+
+    private static Optional<BloomFilter> mergeBloomFilter(BloomFilter filter, Domain domain)
+    {
+        if (domain.bloomFilter.isPresent()) {
+            return filter.union(domain.bloomFilter.get());
+        }
+        ValueSet otherValues = domain.getValues();
+        if (otherValues.isNone()) {
+            return Optional.of(filter);
+        }
+        if (!otherValues.isDiscreteSet()) {
+            // the values of the other domain cannot be enumerated, so the merged filter would miss them
+            return Optional.empty();
+        }
+        return Optional.of(filter.addAll(otherValues.getDiscreteSet()));
     }
 
     private void checkCompatibility(Domain domain)
@@ -267,7 +344,7 @@ public final class Domain
     @Override
     public int hashCode()
     {
-        return Objects.hash(values, nullAllowed);
+        return Objects.hash(values, nullAllowed, bloomFilter);
     }
 
     @Override
@@ -281,7 +358,8 @@ public final class Domain
         }
         Domain other = (Domain) obj;
         return Objects.equals(this.values, other.values) &&
-                this.nullAllowed == other.nullAllowed;
+                this.nullAllowed == other.nullAllowed &&
+                Objects.equals(this.bloomFilter, other.bloomFilter);
     }
 
     /**
@@ -292,6 +370,10 @@ public final class Domain
         return simplify(DEFAULT_COMPACTION_THRESHOLD);
     }
 
+    /**
+     * Reduces the size of the domain, dropping the bloom filter and the discrete components which exceed
+     * {@code threshold}.
+     */
     public Domain simplify(int threshold)
     {
         Optional<ValueSet> simplifiedValueSet = values.getValuesProcessor().transform(
@@ -309,9 +391,13 @@ public final class Domain
                 },
                 _ -> Optional.empty());
         if (simplifiedValueSet.isEmpty()) {
-            return this;
+            if (bloomFilter.isEmpty()) {
+                return this;
+            }
+            // the bloom filter is the largest part of a domain which carries one, and cannot be made smaller
+            return new Domain(values, nullAllowed, Optional.empty());
         }
-        return Domain.create(simplifiedValueSet.get(), nullAllowed);
+        return new Domain(simplifiedValueSet.get(), nullAllowed, Optional.empty());
     }
 
     @Override
@@ -331,12 +417,13 @@ public final class Domain
         if (isOnlyNull()) {
             return "[NULL]";
         }
-        return "[ " + (nullAllowed ? "NULL, " : "") + values.toString(limit) + " ]";
+        String bloomFilterDescription = bloomFilter.map(filter -> ", " + filter).orElse("");
+        return "[ " + (nullAllowed ? "NULL, " : "") + values.toString(limit) + bloomFilterDescription + " ]";
     }
 
     public long getRetainedSizeInBytes()
     {
-        return INSTANCE_SIZE + values.getRetainedSizeInBytes();
+        return INSTANCE_SIZE + values.getRetainedSizeInBytes() + bloomFilter.map(BloomFilter::getRetainedSizeInBytes).orElse(0L);
     }
 
     public static class DiscreteSet

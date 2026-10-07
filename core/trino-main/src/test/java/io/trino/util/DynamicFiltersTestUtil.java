@@ -84,6 +84,15 @@ public final class DynamicFiltersTestUtil
             Map<ColumnHandle, Integer> channels,
             double selectivityThreshold)
     {
+        return createDynamicFilterEvaluator(tupleDomain, channels, selectivityThreshold, false);
+    }
+
+    public static FilterEvaluator createDynamicFilterEvaluator(
+            TupleDomain<ColumnHandle> tupleDomain,
+            Map<ColumnHandle, Integer> channels,
+            double selectivityThreshold,
+            boolean bloomFilterEnabled)
+    {
         TestingDynamicFilter dynamicFilter = new TestingDynamicFilter(1);
         dynamicFilter.update(tupleDomain);
         Map<ColumnHandle, Type> types = tupleDomain.getDomains().orElse(ImmutableMap.of())
@@ -105,7 +114,8 @@ public final class DynamicFiltersTestUtil
                 columns.buildOrThrow(),
                 layout.buildOrThrow(),
                 selectivityThreshold,
-                true)
+                true,
+                bloomFilterEnabled)
                 .createDynamicPageFilterEvaluator(new ColumnarFilterCompiler(PLANNER_CONTEXT, 0), dynamicFilter)
                 .get();
     }

@@ -42,6 +42,7 @@ import org.openjdk.jmh.runner.RunnerException;
 
 import java.util.Iterator;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -116,6 +117,7 @@ public class BenchmarkDynamicFilterSourceOperator
                     maxDistinctValuesCount,
                     DataSize.ofBytes(Long.MAX_VALUE),
                     minMaxCollectionLimit,
+                    Optional.empty(),
                     typeOperators);
         }
 

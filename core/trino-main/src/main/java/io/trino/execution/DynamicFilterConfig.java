@@ -21,6 +21,7 @@ import io.airlift.units.DataSize;
 import io.airlift.units.MaxDataSize;
 import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
 
@@ -83,6 +84,11 @@ public class DynamicFilterConfig
     private int partitionedRangeRowLimitPerDriver = 30_000;
     private DataSize partitionedMaxSizePerOperator = DataSize.of(5, MEGABYTE);
     private DataSize maxSizePerFilter = DataSize.of(10, MEGABYTE);
+
+    private boolean bloomFilterEnabled;
+    private boolean dynamicRowFilteringBloomFilterEnabled;
+    private long bloomFilterExpectedDistinctValues = 1_000_000;
+    private double bloomFilterFalsePositiveProbability = 0.05;
 
     public boolean isEnableDynamicFiltering()
     {
@@ -246,6 +252,62 @@ public class DynamicFilterConfig
     public DynamicFilterConfig setMaxSizePerFilter(DataSize maxSizePerFilter)
     {
         this.maxSizePerFilter = maxSizePerFilter;
+        return this;
+    }
+
+    public boolean isDynamicRowFilteringBloomFilterEnabled()
+    {
+        return dynamicRowFilteringBloomFilterEnabled;
+    }
+
+    @Config("dynamic-row-filtering.bloom-filter.enabled")
+    @ConfigDescription("Use the bloom filter of a dynamic filter to filter rows in the scan operator, in addition to passing it to the connector")
+    public DynamicFilterConfig setDynamicRowFilteringBloomFilterEnabled(boolean dynamicRowFilteringBloomFilterEnabled)
+    {
+        this.dynamicRowFilteringBloomFilterEnabled = dynamicRowFilteringBloomFilterEnabled;
+        return this;
+    }
+
+    public boolean isBloomFilterEnabled()
+    {
+        return bloomFilterEnabled;
+    }
+
+    @Config("dynamic-filtering.bloom-filter.enabled")
+    @ConfigDescription("Collect a bloom filter, instead of only a min/max range, for dynamic filters with too many distinct values")
+    public DynamicFilterConfig setBloomFilterEnabled(boolean bloomFilterEnabled)
+    {
+        this.bloomFilterEnabled = bloomFilterEnabled;
+        return this;
+    }
+
+    @Min(1)
+    @Max(100_000_000)
+    public long getBloomFilterExpectedDistinctValues()
+    {
+        return bloomFilterExpectedDistinctValues;
+    }
+
+    @Config("dynamic-filtering.bloom-filter.expected-distinct-values")
+    @ConfigDescription("Number of distinct values a dynamic filter bloom filter is sized for, which determines its fixed memory footprint of about 1.25 bytes per value at the default false positive probability")
+    public DynamicFilterConfig setBloomFilterExpectedDistinctValues(long bloomFilterExpectedDistinctValues)
+    {
+        this.bloomFilterExpectedDistinctValues = bloomFilterExpectedDistinctValues;
+        return this;
+    }
+
+    @DecimalMin(value = "0.0", inclusive = false)
+    @DecimalMax(value = "1.0", inclusive = false)
+    public double getBloomFilterFalsePositiveProbability()
+    {
+        return bloomFilterFalsePositiveProbability;
+    }
+
+    @Config("dynamic-filtering.bloom-filter.false-positive-probability")
+    @ConfigDescription("Probability with which a dynamic filter bloom filter reports a value it does not contain, at the expected number of distinct values")
+    public DynamicFilterConfig setBloomFilterFalsePositiveProbability(double bloomFilterFalsePositiveProbability)
+    {
+        this.bloomFilterFalsePositiveProbability = bloomFilterFalsePositiveProbability;
         return this;
     }
 }

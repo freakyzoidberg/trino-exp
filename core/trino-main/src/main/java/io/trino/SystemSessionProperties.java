@@ -145,6 +145,8 @@ public final class SystemSessionProperties
     public static final String ENABLE_DYNAMIC_FILTERING = "enable_dynamic_filtering";
     public static final String ENABLE_DYNAMIC_ROW_FILTERING = "enable_dynamic_row_filtering";
     public static final String DYNAMIC_ROW_FILTERING_SELECTIVITY_THRESHOLD = "dynamic_row_filtering_selectivity_threshold";
+    public static final String DYNAMIC_FILTERING_BLOOM_FILTER_ENABLED = "dynamic_filtering_bloom_filter_enabled";
+    public static final String DYNAMIC_ROW_FILTERING_BLOOM_FILTER_ENABLED = "dynamic_row_filtering_bloom_filter_enabled";
     public static final String QUERY_MAX_MEMORY_PER_NODE = "query_max_memory_per_node";
     public static final String IGNORE_DOWNSTREAM_PREFERENCES = "ignore_downstream_preferences";
     public static final String FILTERING_SEMI_JOIN_TO_INNER = "rewrite_filtering_semi_join_to_inner_join";
@@ -695,6 +697,16 @@ public final class SystemSessionProperties
                         ENABLE_DYNAMIC_ROW_FILTERING,
                         "Enable fine-grained filtering of rows in the scan operator using dynamic filters",
                         dynamicFilterConfig.isEnableDynamicRowFiltering(),
+                        false),
+                booleanProperty(
+                        DYNAMIC_FILTERING_BLOOM_FILTER_ENABLED,
+                        "Collect a bloom filter, instead of only a min/max range, for dynamic filters with too many distinct values",
+                        dynamicFilterConfig.isBloomFilterEnabled(),
+                        false),
+                booleanProperty(
+                        DYNAMIC_ROW_FILTERING_BLOOM_FILTER_ENABLED,
+                        "Use the bloom filter of a dynamic filter to filter rows in the scan operator, in addition to passing it to the connector",
+                        dynamicFilterConfig.isDynamicRowFilteringBloomFilterEnabled(),
                         false),
                 doubleProperty(
                         DYNAMIC_ROW_FILTERING_SELECTIVITY_THRESHOLD,
@@ -1670,6 +1682,16 @@ public final class SystemSessionProperties
     public static boolean isEnableDynamicRowFiltering(Session session)
     {
         return session.getSystemProperty(ENABLE_DYNAMIC_ROW_FILTERING, Boolean.class);
+    }
+
+    public static boolean isDynamicFilteringBloomFilterEnabled(Session session)
+    {
+        return session.getSystemProperty(DYNAMIC_FILTERING_BLOOM_FILTER_ENABLED, Boolean.class);
+    }
+
+    public static boolean isDynamicRowFilteringBloomFilterEnabled(Session session)
+    {
+        return session.getSystemProperty(DYNAMIC_ROW_FILTERING_BLOOM_FILTER_ENABLED, Boolean.class);
     }
 
     public static double getDynamicRowFilterSelectivityThreshold(Session session)

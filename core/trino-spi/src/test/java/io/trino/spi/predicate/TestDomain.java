@@ -26,6 +26,7 @@ import io.trino.spi.type.Type;
 import org.junit.jupiter.api.Test;
 
 import java.util.Map;
+import java.util.Optional;
 
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.BooleanType.BOOLEAN;
@@ -558,6 +559,105 @@ class TestDomain
 
         domain = Domain.create(ValueSet.ofRanges(Range.lessThan(BIGINT, 0L), Range.equal(BIGINT, 1L), Range.range(BIGINT, 2L, true, 3L, true)), true);
         assertThat(domain).isEqualTo(mapper.readValue(mapper.writeValueAsString(domain), Domain.class));
+
+        domain = bloomFilterDomain(1L, 2L, 3L);
+        Domain deserialized = mapper.readValue(mapper.writeValueAsString(domain), Domain.class);
+        assertThat(deserialized).isEqualTo(domain);
+        assertThat(deserialized.getBloomFilter().orElseThrow().mightContain(1L)).isTrue();
+
+        // domains without a bloom filter keep their serialized form unchanged
+        assertThat(mapper.writeValueAsString(Domain.singleValue(BIGINT, 1L)))
+                .doesNotContain("bloomFilter");
+    }
+
+    @Test
+    public void testBloomFilterIsAdditive()
+    {
+        Domain domain = bloomFilterDomain(1L, 2L, 3L);
+
+        // the value set keeps working exactly as it does without a bloom filter
+        assertThat(domain.getValues()).isEqualTo(ValueSet.ofRanges(Range.range(BIGINT, 1L, true, 3L, true)));
+        assertThat(domain.getValues().getRanges().getRangeCount()).isEqualTo(1);
+        assertThat(domain.includesNullableValue(2L)).isTrue();
+        assertThat(domain.isNullAllowed()).isFalse();
+        assertThat(domain.getRetainedSizeInBytes()).isGreaterThan(Domain.singleValue(BIGINT, 1L).getRetainedSizeInBytes());
+        assertThat(domain.toString()).contains("datasketches bloom filter");
+
+        BloomFilter filter = domain.getBloomFilter().orElseThrow();
+        assertThat(filter.mightContain(1L)).isTrue();
+        assertThat(filter.mightContain(4L)).isFalse();
+    }
+
+    @Test
+    public void testBloomFilterUnion()
+    {
+        Domain first = bloomFilterDomain(1L, 2L);
+        Domain second = bloomFilterDomain(30L, 40L);
+
+        Domain union = first.union(second);
+        BloomFilter unionFilter = union.getBloomFilter().orElseThrow();
+        assertThat(unionFilter.mightContain(1L)).isTrue();
+        assertThat(unionFilter.mightContain(40L)).isTrue();
+        assertThat(unionFilter.mightContain(4L)).isFalse();
+        assertThat(Domain.union(ImmutableList.of(first, second))).isEqualTo(union);
+
+        // a domain which did not degrade contributes its discrete values to the filter
+        Domain discrete = Domain.multipleValues(BIGINT, ImmutableList.of(70L, 80L));
+        BloomFilter absorbed = first.union(discrete).getBloomFilter().orElseThrow();
+        assertThat(absorbed.mightContain(1L)).isTrue();
+        assertThat(absorbed.mightContain(70L)).isTrue();
+        assertThat(absorbed.mightContain(4L)).isFalse();
+        assertThat(Domain.union(ImmutableList.of(discrete, first)).getBloomFilter()).contains(absorbed);
+
+        // values which cannot be enumerated would be missing from the filter, so it is dropped
+        Domain range = Domain.create(ValueSet.ofRanges(Range.range(BIGINT, 100L, true, 200L, true)), false);
+        assertThat(first.union(range).getBloomFilter()).isEmpty();
+        assertThat(Domain.union(ImmutableList.of(first, range)).getBloomFilter()).isEmpty();
+        assertThat(first.union(Domain.all(BIGINT)).getBloomFilter()).isEmpty();
+    }
+
+    @Test
+    public void testBloomFilterOnDerivedDomains()
+    {
+        Domain domain = bloomFilterDomain(1L, 2L, 3L);
+        Domain other = Domain.create(ValueSet.ofRanges(Range.range(BIGINT, 2L, true, 100L, true)), false);
+
+        // intersection and difference are subsets, so the filter remains a superset of the result
+        assertThat(domain.intersect(other).getBloomFilter()).isEqualTo(domain.getBloomFilter());
+        assertThat(other.intersect(domain).getBloomFilter()).isEqualTo(domain.getBloomFilter());
+        assertThat(domain.subtract(other).getBloomFilter()).isEqualTo(domain.getBloomFilter());
+        // the complement of a superset is not a superset of the complement
+        assertThat(domain.complement().getBloomFilter()).isEmpty();
+
+        // simplification is used to shrink a domain which exceeds a size limit, and the bloom filter is its
+        // largest part, so it is dropped
+        Domain manyRanges = Domain.create(
+                ValueSet.ofRanges(Range.equal(BIGINT, 1L), Range.equal(BIGINT, 3L), Range.equal(BIGINT, 5L)),
+                false,
+                domain.getBloomFilter());
+        assertThat(manyRanges.simplify(1).getBloomFilter()).isEmpty();
+        assertThat(manyRanges.simplify(1).getValues()).isEqualTo(ValueSet.ofRanges(Range.range(BIGINT, 1L, true, 5L, true)));
+        assertThat(domain.simplify(1).getBloomFilter()).isEmpty();
+        assertThat(domain.simplify(1).getValues()).isEqualTo(domain.getValues());
+        // a domain without a bloom filter is unaffected
+        Domain withoutFilter = Domain.singleValue(BIGINT, 1L);
+        assertThat(withoutFilter.simplify(1)).isSameAs(withoutFilter);
+    }
+
+    private static Domain bloomFilterDomain(long... values)
+    {
+        BloomFilterBuilder builder = BloomFilterKind.DATASKETCHES.createBuilder(BIGINT, 1000, 0.01);
+        long min = Long.MAX_VALUE;
+        long max = Long.MIN_VALUE;
+        for (long value : values) {
+            builder.add(value);
+            min = Math.min(min, value);
+            max = Math.max(max, value);
+        }
+        return Domain.create(
+                ValueSet.ofRanges(Range.range(BIGINT, min, true, max, true)),
+                false,
+                Optional.of(builder.build()));
     }
 
     private void assertUnion(Domain first, Domain second, Domain expected)

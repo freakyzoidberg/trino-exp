@@ -828,6 +828,7 @@ public class PlanTester
         LocalExecutionPlanner executionPlanner = new LocalExecutionPlanner(
                 plannerContext,
                 Optional.empty(),
+                catalogManager,
                 pageSourceManager,
                 indexManager,
                 partitionFunctionProvider,

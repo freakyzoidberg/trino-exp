@@ -15,6 +15,7 @@ package io.trino.spi.connector;
 
 import io.trino.spi.function.FunctionProvider;
 import io.trino.spi.function.table.ConnectorTableFunction;
+import io.trino.spi.predicate.BloomFilterKind;
 import io.trino.spi.procedure.Procedure;
 import io.trino.spi.session.PropertyMetadata;
 import io.trino.spi.transaction.IsolationLevel;
@@ -257,6 +258,24 @@ public interface Connector
     void shutdown();
 
     default Set<ConnectorCapabilities> getCapabilities()
+    {
+        return emptySet();
+    }
+
+    /**
+     * Bloom filter implementations this connector is able to read from
+     * {@link io.trino.spi.predicate.Domain#getBloomFilter()}.
+     * <p>
+     * When a dynamic filter collects more distinct values than it can keep, the engine degrades it to a
+     * coarser representation. For a table scan of this connector, the engine additionally collects a bloom
+     * filter of one of the returned kinds, which is far more selective than the min/max range it degrades to
+     * otherwise. Returning an empty set, the default, disables that collection.
+     * <p>
+     * A dynamic filter can be consumed by table scans of several connectors, so a connector must ignore a
+     * filter whose {@link io.trino.spi.predicate.BloomFilter#kind()} it did not declare, and rely on
+     * {@link io.trino.spi.predicate.Domain#getValues()} alone.
+     */
+    default Set<BloomFilterKind> getSupportedDynamicFilterBloomFilterKinds()
     {
         return emptySet();
     }

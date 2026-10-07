@@ -19,6 +19,8 @@ import io.airlift.units.DataSize;
 import io.trino.spi.Page;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.BlockBuilder;
+import io.trino.spi.predicate.BloomFilter;
+import io.trino.spi.predicate.BloomFilterKind;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.predicate.ValueSet;
@@ -36,6 +38,7 @@ import org.junit.jupiter.api.TestInstance;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.stream.IntStream;
@@ -124,13 +127,14 @@ public class TestDynamicFilterSourceOperator
 
     private OperatorFactory createOperatorFactory(DynamicFilterSourceOperator.Channel... buildChannels)
     {
-        return createOperatorFactory(100, DataSize.of(10, KILOBYTE), 1_000_000, Arrays.asList(buildChannels));
+        return createOperatorFactory(100, DataSize.of(10, KILOBYTE), 1_000_000, Optional.empty(), Arrays.asList(buildChannels));
     }
 
     private OperatorFactory createOperatorFactory(
             int maxFilterDistinctValues,
             DataSize maxFilterSize,
             int minMaxCollectionLimit,
+            Optional<BloomFilterOptions> bloomFilterOptions,
             Iterable<DynamicFilterSourceOperator.Channel> buildChannels)
     {
         return new DynamicFilterSourceOperator.DynamicFilterSourceOperatorFactory(
@@ -157,6 +161,7 @@ public class TestDynamicFilterSourceOperator
                 maxFilterDistinctValues,
                 maxFilterSize,
                 minMaxCollectionLimit,
+                bloomFilterOptions,
                 typeOperators);
     }
 
@@ -188,7 +193,7 @@ public class TestDynamicFilterSourceOperator
         List<DynamicFilterSourceOperator.Channel> buildChannels = IntStream.range(0, types.size())
                 .mapToObj(i -> channel(i, types.get(i)))
                 .collect(toImmutableList());
-        OperatorFactory operatorFactory = createOperatorFactory(maxFilterDistinctValues, maxFilterSize, minMaxCollectionLimit, buildChannels);
+        OperatorFactory operatorFactory = createOperatorFactory(maxFilterDistinctValues, maxFilterSize, minMaxCollectionLimit, Optional.empty(), buildChannels);
         try (Operator operator = createOperator(operatorFactory)) {
             verifyPassthrough(operator, types, pages);
             operatorFactory.noMoreOperators();
@@ -462,6 +467,137 @@ public class TestDynamicFilterSourceOperator
                         new DynamicFilterId("0"), Domain.create(
                                 ValueSet.ofRanges(range(BIGINT, 0L, true, (long) maxDistinctValues, true)),
                                 false)))));
+    }
+
+    @Test
+    public void testCollectBloomFilterWhenTooManyDistinctValues()
+            throws Exception
+    {
+        int maxDistinctValues = 100;
+        List<TupleDomain<DynamicFilterId>> collected = collectWithBloomFilter(
+                maxDistinctValues,
+                ImmutableList.of(BIGINT),
+                ImmutableList.of(new Page(createLongSequenceBlock(0, 10 * maxDistinctValues))));
+
+        Domain domain = domain(collected);
+        // the min/max range is still collected, so connectors which cannot read a bloom filter are unaffected
+        assertThat(domain.getValues()).isEqualTo(ValueSet.ofRanges(range(BIGINT, 0L, true, 10L * maxDistinctValues - 1, true)));
+        assertThat(domain.isNullAllowed()).isFalse();
+
+        BloomFilter bloomFilter = domain.getBloomFilter().orElseThrow();
+        for (long value = 0; value < 10L * maxDistinctValues; value++) {
+            assertThat(bloomFilter.mightContain(value)).isTrue();
+        }
+        assertThat(bloomFilter.mightContain(10L * maxDistinctValues)).isFalse();
+    }
+
+    @Test
+    public void testCollectBloomFilterForTypeWithoutMinMax()
+            throws Exception
+    {
+        // DOUBLE is excluded from min/max collection because of NaN, so today such a filter is dropped entirely
+        int maxDistinctValues = 100;
+        List<TupleDomain<DynamicFilterId>> collected = collectWithBloomFilter(
+                maxDistinctValues,
+                ImmutableList.of(DOUBLE),
+                ImmutableList.of(
+                        new Page(createDoubleSequenceBlock(0, 10 * maxDistinctValues)),
+                        new Page(createDoubleRepeatBlock(Double.NaN, 10))));
+
+        Domain domain = domain(collected);
+        assertThat(domain.getValues()).isEqualTo(ValueSet.all(DOUBLE));
+        assertThat(domain.isNullAllowed()).isFalse();
+
+        BloomFilter bloomFilter = domain.getBloomFilter().orElseThrow();
+        for (int value = 0; value < 10 * maxDistinctValues; value++) {
+            assertThat(bloomFilter.mightContain((double) value)).isTrue();
+        }
+    }
+
+    @Test
+    public void testBloomFilterIsNotCollectedBelowDistinctValuesLimit()
+            throws Exception
+    {
+        int maxDistinctValues = 100;
+        List<TupleDomain<DynamicFilterId>> collected = collectWithBloomFilter(
+                maxDistinctValues,
+                ImmutableList.of(BIGINT),
+                ImmutableList.of(new Page(createLongSequenceBlock(0, 10))));
+
+        // the exact set of values is more selective than a bloom filter
+        assertThat(collected).isEqualTo(ImmutableList.of(TupleDomain.withColumnDomains(ImmutableMap.of(
+                new DynamicFilterId("0"), Domain.create(ValueSet.of(BIGINT, 0L, 1L, 2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L), false)))));
+    }
+
+    @Test
+    public void testBloomFilterIsNotCollectedForNonOrderableType()
+            throws Exception
+    {
+        // a degraded domain must stay range shaped for consumers which cannot read the bloom filter
+        int maxDistinctValues = 100;
+        List<TupleDomain<DynamicFilterId>> collected = collectWithBloomFilter(
+                maxDistinctValues,
+                ImmutableList.of(COLOR),
+                ImmutableList.of(new Page(createColorSequenceBlock(0, maxDistinctValues + 1))));
+
+        assertThat(collected).isEqualTo(ImmutableList.of(TupleDomain.all()));
+    }
+
+    @Test
+    public void testCollectBloomFilterWhenMinMaxCollectionLimitIsExceeded()
+            throws Exception
+    {
+        // once the min/max row limit is exhausted the range is dropped, but the bloom filter keeps being collected
+        int maxDistinctValues = 100;
+        List<TupleDomain<DynamicFilterId>> collected = collectWithBloomFilter(
+                maxDistinctValues,
+                (2 * maxDistinctValues) + 1,
+                ImmutableList.of(BIGINT),
+                ImmutableList.of(
+                        new Page(createLongSequenceBlock(0, maxDistinctValues + 1)),
+                        new Page(createLongSequenceBlock(maxDistinctValues + 1, 4 * maxDistinctValues))));
+
+        Domain domain = domain(collected);
+        assertThat(domain.getValues()).isEqualTo(ValueSet.all(BIGINT));
+        assertThat(domain.isNullAllowed()).isFalse();
+
+        BloomFilter bloomFilter = domain.getBloomFilter().orElseThrow();
+        for (long value = 0; value < 4L * maxDistinctValues; value++) {
+            assertThat(bloomFilter.mightContain(value)).isTrue();
+        }
+        assertThat(bloomFilter.mightContain(4L * maxDistinctValues)).isFalse();
+    }
+
+    private List<TupleDomain<DynamicFilterId>> collectWithBloomFilter(int maxDistinctValues, List<Type> types, List<Page> pages)
+            throws Exception
+    {
+        return collectWithBloomFilter(maxDistinctValues, 1_000_000, types, pages);
+    }
+
+    private List<TupleDomain<DynamicFilterId>> collectWithBloomFilter(int maxDistinctValues, int minMaxCollectionLimit, List<Type> types, List<Page> pages)
+            throws Exception
+    {
+        List<DynamicFilterSourceOperator.Channel> buildChannels = IntStream.range(0, types.size())
+                .mapToObj(i -> channel(i, types.get(i)))
+                .collect(toImmutableList());
+        OperatorFactory operatorFactory = createOperatorFactory(
+                maxDistinctValues,
+                DataSize.of(10, KILOBYTE),
+                minMaxCollectionLimit,
+                Optional.of(new BloomFilterOptions(BloomFilterKind.DATASKETCHES, 10_000, 0.01)),
+                buildChannels);
+        try (Operator operator = createOperator(operatorFactory)) {
+            verifyPassthrough(operator, types, pages);
+            operatorFactory.noMoreOperators();
+            assertThat(operator.getOperatorContext().getOperatorMemoryContext().getUserMemory()).isEqualTo(0);
+        }
+        return partitions.build();
+    }
+
+    private static Domain domain(List<TupleDomain<DynamicFilterId>> collected)
+    {
+        assertThat(collected).hasSize(1);
+        return collected.get(0).getDomains().orElseThrow().get(new DynamicFilterId("0"));
     }
 
     @Test

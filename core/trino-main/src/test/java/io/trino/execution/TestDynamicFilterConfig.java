@@ -42,7 +42,11 @@ public class TestDynamicFilterConfig
                 .setPartitionedMaxSizePerDriver(DataSize.of(200, KILOBYTE))
                 .setPartitionedRangeRowLimitPerDriver(30_000)
                 .setPartitionedMaxSizePerOperator(DataSize.of(5, MEGABYTE))
-                .setMaxSizePerFilter(DataSize.of(10, MEGABYTE)));
+                .setMaxSizePerFilter(DataSize.of(10, MEGABYTE))
+                .setBloomFilterEnabled(false)
+                .setBloomFilterExpectedDistinctValues(1_000_000)
+                .setBloomFilterFalsePositiveProbability(0.05)
+                .setDynamicRowFilteringBloomFilterEnabled(false));
     }
 
     @Test
@@ -61,6 +65,10 @@ public class TestDynamicFilterConfig
                 .put("dynamic-filtering.partitioned.range-row-limit-per-driver", "200000")
                 .put("dynamic-filtering.partitioned.max-size-per-operator", "643kB")
                 .put("dynamic-filtering.max-size-per-filter", "3411kB")
+                .put("dynamic-filtering.bloom-filter.enabled", "true")
+                .put("dynamic-filtering.bloom-filter.expected-distinct-values", "2000000")
+                .put("dynamic-filtering.bloom-filter.false-positive-probability", "0.2")
+                .put("dynamic-row-filtering.bloom-filter.enabled", "true")
                 .buildOrThrow();
 
         DynamicFilterConfig expected = new DynamicFilterConfig()
@@ -75,7 +83,11 @@ public class TestDynamicFilterConfig
                 .setPartitionedMaxSizePerDriver(DataSize.of(64, KILOBYTE))
                 .setPartitionedRangeRowLimitPerDriver(200000)
                 .setPartitionedMaxSizePerOperator(DataSize.of(643, KILOBYTE))
-                .setMaxSizePerFilter(DataSize.of(3411, KILOBYTE));
+                .setMaxSizePerFilter(DataSize.of(3411, KILOBYTE))
+                .setBloomFilterEnabled(true)
+                .setBloomFilterExpectedDistinctValues(2_000_000)
+                .setBloomFilterFalsePositiveProbability(0.2)
+                .setDynamicRowFilteringBloomFilterEnabled(true);
 
         assertFullMapping(properties, expected);
     }

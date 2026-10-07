@@ -13,6 +13,7 @@
  */
 package io.trino.sql.gen.columnar;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
 import io.trino.Session;
@@ -21,6 +22,7 @@ import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.DynamicFilter;
 import io.trino.spi.connector.SourcePage;
+import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.sql.PlannerContext;
 import io.trino.sql.ir.Expression;
@@ -33,11 +35,9 @@ import jakarta.annotation.Nullable;
 
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
-import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static io.trino.SystemSessionProperties.getCharVarcharCoercion;
 import static io.trino.sql.gen.columnar.FilterEvaluator.createColumnarFilterEvaluator;
@@ -52,6 +52,7 @@ public final class DynamicPageFilter
     private final Map<Symbol, Integer> sourceLayout;
     private final double selectivityThreshold;
     private final boolean filterReorderingEnabled;
+    private final boolean bloomFilterEnabled;
 
     @Nullable
     @GuardedBy("this")
@@ -69,7 +70,8 @@ public final class DynamicPageFilter
             Map<Symbol, ColumnHandle> columnHandles,
             Map<Symbol, Integer> sourceLayout,
             double selectivityThreshold,
-            boolean filterReorderingEnabled)
+            boolean filterReorderingEnabled,
+            boolean bloomFilterEnabled)
     {
         this.session = requireNonNull(session, "session is null");
         this.irExpressionOptimizer = plannerContext.getExpressionOptimizer();
@@ -80,6 +82,7 @@ public final class DynamicPageFilter
         this.sourceLayout = ImmutableMap.copyOf(sourceLayout);
         this.selectivityThreshold = selectivityThreshold;
         this.filterReorderingEnabled = filterReorderingEnabled;
+        this.bloomFilterEnabled = bloomFilterEnabled;
     }
 
     // Compiled dynamic filter is generated once per split at PageProcessor#createWorkProcessor.
@@ -124,22 +127,30 @@ public final class DynamicPageFilter
         CharVarcharCoercion charVarcharCoercion = getCharVarcharCoercion(session);
         // We translate each conjunct into separate FilterEvaluator to make it easy to profile selectivity
         // of dynamic filter per column and drop them if they're ineffective
-        List<Supplier<FilterEvaluator>> subExpressionEvaluators = currentPredicate.getDomains().orElseThrow()
-                .entrySet().stream()
-                .map(entry -> {
-                    Symbol symbol = columnHandles.get(entry.getKey());
-                    Expression expression = domainTranslator.toPredicate(getCharVarcharCoercion(session), entry.getValue(), symbol.toSymbolReference());
-                    // Run the expression derived from TupleDomain through IR optimizer to simplify predicates. E.g. SimplifyContinuousInValues
-                    expression = irExpressionOptimizer.process(expression, session, symbolAllocator, ImmutableMap.of()).orElse(expression);
-                    return createColumnarFilterEvaluator(charVarcharCoercion, expression, sourceLayout, compiler, filterReorderingEnabled, true);
-                })
-                .filter(Optional::isPresent)
-                .map(Optional::get)
-                .collect(toImmutableList());
+        ImmutableList.Builder<Supplier<FilterEvaluator>> subExpressionEvaluators = ImmutableList.builder();
+        for (Map.Entry<ColumnHandle, Domain> entry : currentPredicate.getDomains().orElseThrow().entrySet()) {
+            Symbol symbol = columnHandles.get(entry.getKey());
+            Domain domain = entry.getValue();
+            Expression expression = domainTranslator.toPredicate(charVarcharCoercion, domain, symbol.toSymbolReference());
+            // Run the expression derived from TupleDomain through IR optimizer to simplify predicates. E.g. SimplifyContinuousInValues
+            expression = irExpressionOptimizer.process(expression, session, symbolAllocator, ImmutableMap.of()).orElse(expression);
+            createColumnarFilterEvaluator(charVarcharCoercion, expression, sourceLayout, compiler, filterReorderingEnabled, true)
+                    .ifPresent(subExpressionEvaluators::add);
+            // A bloom filter has no expression form, so it is applied as an additional conjunct for the same column
+            if (bloomFilterEnabled) {
+                domain.getBloomFilter().ifPresent(bloomFilter -> {
+                    Integer channel = sourceLayout.get(symbol);
+                    if (channel != null) {
+                        subExpressionEvaluators.add(() -> new BloomFilterEvaluator(channel, bloomFilter, domain.isNullAllowed()));
+                    }
+                });
+            }
+        }
+        List<Supplier<FilterEvaluator>> evaluators = subExpressionEvaluators.build();
         return () -> {
-            FilterEvaluator[] filterEvaluators = new FilterEvaluator[subExpressionEvaluators.size()];
+            FilterEvaluator[] filterEvaluators = new FilterEvaluator[evaluators.size()];
             for (int i = 0; i < filterEvaluators.length; i++) {
-                filterEvaluators[i] = requireNonNull(subExpressionEvaluators.get(i).get(), "subExpressionEvaluator is null");
+                filterEvaluators[i] = requireNonNull(evaluators.get(i).get(), "subExpressionEvaluator is null");
             }
             return new DynamicFilterEvaluator(filterEvaluators, selectivityThreshold);
         };

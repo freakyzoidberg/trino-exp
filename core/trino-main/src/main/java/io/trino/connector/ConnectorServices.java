@@ -41,6 +41,7 @@ import io.trino.spi.function.table.ArgumentSpecification;
 import io.trino.spi.function.table.ConnectorTableFunction;
 import io.trino.spi.function.table.ReturnTypeSpecification.DescribedTable;
 import io.trino.spi.function.table.TableArgumentSpecification;
+import io.trino.spi.predicate.BloomFilterKind;
 import io.trino.spi.procedure.Procedure;
 import io.trino.spi.security.TrinoPrincipal;
 import io.trino.spi.session.PropertyMetadata;
@@ -89,6 +90,7 @@ public class ConnectorServices
     private final Map<String, PropertyMetadata<?>> analyzeProperties;
     private final Map<String, PropertyMetadata<?>> branchProperties;
     private final Set<ConnectorCapabilities> capabilities;
+    private final Set<BloomFilterKind> supportedDynamicFilterBloomFilterKinds;
 
     private final AtomicBoolean shutdown = new AtomicBoolean();
 
@@ -216,6 +218,10 @@ public class ConnectorServices
         Set<ConnectorCapabilities> capabilities = connector.getCapabilities();
         requireNonNull(capabilities, format("Connector '%s' returned a null capabilities set", catalogHandle));
         this.capabilities = capabilities;
+
+        Set<BloomFilterKind> supportedDynamicFilterBloomFilterKinds = connector.getSupportedDynamicFilterBloomFilterKinds();
+        requireNonNull(supportedDynamicFilterBloomFilterKinds, format("Connector '%s' returned a null dynamic filter bloom filter kinds set", catalogHandle));
+        this.supportedDynamicFilterBloomFilterKinds = ImmutableSet.copyOf(supportedDynamicFilterBloomFilterKinds);
     }
 
     public Tracer getTracer()
@@ -337,6 +343,11 @@ public class ConnectorServices
     public Set<ConnectorCapabilities> getCapabilities()
     {
         return capabilities;
+    }
+
+    public Set<BloomFilterKind> getSupportedDynamicFilterBloomFilterKinds()
+    {
+        return supportedDynamicFilterBloomFilterKinds;
     }
 
     public void shutdown()

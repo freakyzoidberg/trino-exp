@@ -383,6 +383,14 @@
         </dependency>
 
         <dependency>
+            <!-- Backs io.trino.spi.predicate.DataSketchesBloomFilter, which trino-spi declares as optional -->
+            <groupId>org.apache.datasketches</groupId>
+            <artifactId>datasketches-java</artifactId>
+            <version>${dep.datasketches.version}</version>
+            <scope>runtime</scope>
+        </dependency>
+
+        <dependency>
             <groupId>com.h2database</groupId>
             <artifactId>h2</artifactId>
             <scope>test</scope>

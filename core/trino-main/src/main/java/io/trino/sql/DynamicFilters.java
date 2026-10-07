@@ -306,32 +306,47 @@ public final class DynamicFilters
                 }
                 return domain;
             }
-            Range span = domain.getValues().getRanges().getSpan();
             return switch (operator) {
                 case EQUAL -> {
                     if (nullAllowed) {
-                        yield Domain.create(domain.getValues(), true);
+                        yield Domain.create(domain.getValues(), true, domain.getBloomFilter());
                     }
                     yield domain;
                 }
-                case LESS_THAN -> {
-                    Range range = Range.lessThan(span.getType(), span.getHighBoundedValue());
-                    yield Domain.create(ValueSet.ofRanges(range), false);
-                }
-                case LESS_THAN_OR_EQUAL -> {
-                    Range range = Range.lessThanOrEqual(span.getType(), span.getHighBoundedValue());
-                    yield Domain.create(ValueSet.ofRanges(range), false);
-                }
-                case GREATER_THAN -> {
-                    Range range = Range.greaterThan(span.getType(), span.getLowBoundedValue());
-                    yield Domain.create(ValueSet.ofRanges(range), false);
-                }
-                case GREATER_THAN_OR_EQUAL -> {
-                    Range range = Range.greaterThanOrEqual(span.getType(), span.getLowBoundedValue());
-                    yield Domain.create(ValueSet.ofRanges(range), false);
-                }
+                // a bloom filter cannot answer a range query, so only the span of the collected values is used
+                case LESS_THAN -> highBoundedSpan(domain)
+                        .map(span -> Domain.create(ValueSet.ofRanges(Range.lessThan(span.getType(), span.getHighBoundedValue())), false))
+                        .orElseGet(() -> Domain.all(domain.getType()));
+                case LESS_THAN_OR_EQUAL -> highBoundedSpan(domain)
+                        .map(span -> Domain.create(ValueSet.ofRanges(Range.lessThanOrEqual(span.getType(), span.getHighBoundedValue())), false))
+                        .orElseGet(() -> Domain.all(domain.getType()));
+                case GREATER_THAN -> lowBoundedSpan(domain)
+                        .map(span -> Domain.create(ValueSet.ofRanges(Range.greaterThan(span.getType(), span.getLowBoundedValue())), false))
+                        .orElseGet(() -> Domain.all(domain.getType()));
+                case GREATER_THAN_OR_EQUAL -> lowBoundedSpan(domain)
+                        .map(span -> Domain.create(ValueSet.ofRanges(Range.greaterThanOrEqual(span.getType(), span.getLowBoundedValue())), false))
+                        .orElseGet(() -> Domain.all(domain.getType()));
                 default -> throw new IllegalArgumentException("Unsupported dynamic filtering comparison operator: " + operator);
             };
+        }
+
+        private static Optional<Range> highBoundedSpan(Domain domain)
+        {
+            return span(domain).filter(span -> !span.isHighUnbounded());
+        }
+
+        private static Optional<Range> lowBoundedSpan(Domain domain)
+        {
+            return span(domain).filter(span -> !span.isLowUnbounded());
+        }
+
+        private static Optional<Range> span(Domain domain)
+        {
+            if (!domain.getType().isOrderable()) {
+                // values of a non-orderable type cannot be expressed as a range
+                return Optional.empty();
+            }
+            return Optional.of(domain.getValues().getRanges().getSpan());
         }
     }
 

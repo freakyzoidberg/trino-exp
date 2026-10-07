@@ -26,6 +26,8 @@ import io.trino.spi.block.RowBlock;
 import io.trino.spi.block.SqlRow;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.SourcePage;
+import io.trino.spi.predicate.BloomFilterBuilder;
+import io.trino.spi.predicate.BloomFilterKind;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.Range;
 import io.trino.spi.predicate.TupleDomain;
@@ -277,7 +279,8 @@ public class TestDynamicPageFilter
                 ImmutableMap.of(symbolA, columnA, symbolB, columnB, symbolC, columnC),
                 ImmutableMap.of(symbolA, 0, symbolB, 1, symbolC, 2),
                 1,
-                true);
+                true,
+                false);
         SourcePage page = SourcePage.create(new Page(
                 createLongSequenceBlock(0, 101),
                 createLongSequenceBlock(100, 201),
@@ -321,7 +324,8 @@ public class TestDynamicPageFilter
                 ImmutableMap.of(symbolA, columnA, symbolB, columnB, symbolC, columnC),
                 ImmutableMap.of(symbolA, 0, symbolB, 1, symbolC, 2),
                 1,
-                true);
+                true,
+                false);
         SourcePage page = SourcePage.create(new Page(
                 createLongSequenceBlock(0, 101),
                 createLongSequenceBlock(100, 201),
@@ -363,7 +367,8 @@ public class TestDynamicPageFilter
                 ImmutableMap.of(symbol, column),
                 ImmutableMap.of(symbol, 0),
                 1,
-                true);
+                true,
+                false);
         TestingDynamicFilter dynamicFilter = new TestingDynamicFilter(1);
         // 8+ values skip the lookupswitch path so the dynamic filter takes the set-field route
         dynamicFilter.update(TupleDomain.withColumnDomains(
@@ -489,6 +494,70 @@ public class TestDynamicPageFilter
             assertThat(inputPage.wasLoaded(3)).isTrue();
             assertThat(inputPage.wasLoaded(4)).isFalse();
         }
+    }
+
+    @Test
+    public void testBloomFilter()
+    {
+        ColumnHandle column = new TestingColumnHandle("column");
+        // a domain which degraded to a range keeps every value in [0, 100], the bloom filter keeps only the collected ones
+        Domain domain = bloomFilterDomain(column, 0L, 100L, ImmutableList.of(2L, 5L, 99L));
+        SourcePage page = SourcePage.create(new Page(createLongsBlock(1L, 2L, null, 5L, 99L, 200L)));
+
+        FilterEvaluator withoutBloomFilter = createDynamicFilterEvaluator(
+                TupleDomain.withColumnDomains(ImmutableMap.of(column, domain)),
+                ImmutableMap.of(column, 0),
+                1,
+                false);
+        verifySelectedPositions(filterPage(page, withoutBloomFilter), new int[] {0, 1, 3, 4});
+
+        FilterEvaluator withBloomFilter = createDynamicFilterEvaluator(
+                TupleDomain.withColumnDomains(ImmutableMap.of(column, domain)),
+                ImmutableMap.of(column, 0),
+                1,
+                true);
+        verifySelectedPositions(filterPage(page, withBloomFilter), new int[] {1, 3, 4});
+    }
+
+    @Test
+    public void testBloomFilterKeepsNullsWhenAllowed()
+    {
+        ColumnHandle column = new TestingColumnHandle("column");
+        Domain domain = bloomFilterDomain(column, 0L, 100L, ImmutableList.of(5L));
+        Domain nullableDomain = Domain.create(domain.getValues(), true, domain.getBloomFilter());
+        SourcePage page = SourcePage.create(new Page(createLongsBlock(1L, null, 5L)));
+
+        FilterEvaluator filterEvaluator = createDynamicFilterEvaluator(
+                TupleDomain.withColumnDomains(ImmutableMap.of(column, nullableDomain)),
+                ImmutableMap.of(column, 0),
+                1,
+                true);
+        verifySelectedPositions(filterPage(page, filterEvaluator), new int[] {1, 2});
+    }
+
+    @Test
+    public void testBloomFilterSelectsWholeRange()
+    {
+        ColumnHandle column = new TestingColumnHandle("column");
+        Domain domain = bloomFilterDomain(column, 0L, 100L, ImmutableList.of(1L, 2L, 3L));
+        SourcePage page = SourcePage.create(new Page(createLongsBlock(1L, 2L, 3L)));
+
+        FilterEvaluator filterEvaluator = createDynamicFilterEvaluator(
+                TupleDomain.withColumnDomains(ImmutableMap.of(column, domain)),
+                ImmutableMap.of(column, 0),
+                1,
+                true);
+        verifySelectedPositions(filterPage(page, filterEvaluator), 3);
+    }
+
+    private static Domain bloomFilterDomain(ColumnHandle column, long min, long max, List<Long> collectedValues)
+    {
+        BloomFilterBuilder builder = BloomFilterKind.DATASKETCHES.createBuilder(BIGINT, 1000, 0.01);
+        collectedValues.forEach(builder::add);
+        return Domain.create(
+                ValueSet.ofRanges(Range.range(BIGINT, min, true, max, true)),
+                false,
+                Optional.of(builder.build()));
     }
 
     private static SelectedPositions filterPage(SourcePage page, FilterEvaluator filterEvaluator)

@@ -52,6 +52,7 @@ import static io.trino.type.UnknownType.UNKNOWN;
  */
 public sealed interface FilterEvaluator
         permits AndFilterEvaluator,
+                BloomFilterEvaluator,
                 ColumnarFilterEvaluator,
                 DynamicFilterEvaluator,
                 OrFilterEvaluator,

@@ -20,6 +20,8 @@ import io.airlift.configuration.secrets.SecretsResolver;
 import io.opentelemetry.api.trace.Span;
 import io.trino.connector.CatalogHandle;
 import io.trino.connector.CatalogServiceProvider;
+import io.trino.connector.ConnectorServices;
+import io.trino.connector.ConnectorServicesProvider;
 import io.trino.cost.StatsAndCosts;
 import io.trino.exchange.ExchangeManagerConfig;
 import io.trino.exchange.ExchangeManagerRegistry;
@@ -34,6 +36,7 @@ import io.trino.operator.index.IndexManager;
 import io.trino.server.protocol.spooling.QueryDataEncoders;
 import io.trino.server.protocol.spooling.SpoolingEnabledConfig;
 import io.trino.spi.NodeVersion;
+import io.trino.spi.catalog.CatalogProperties;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spiller.GenericSpillerFactory;
 import io.trino.split.PageSinkManager;
@@ -154,6 +157,7 @@ public final class TaskTestUtils
         return new LocalExecutionPlanner(
                 PLANNER_CONTEXT,
                 Optional.empty(),
+                new NoConnectorServicesProvider(),
                 pageSourceManager,
                 new IndexManager(CatalogServiceProvider.fail()),
                 partitionFunctionProvider,
@@ -192,5 +196,33 @@ public final class TaskTestUtils
     public static TaskInfo updateTask(SqlTask sqlTask, List<SplitAssignment> splitAssignments, OutputBuffers outputBuffers)
     {
         return sqlTask.updateTask(TEST_SESSION, Span.getInvalid(), Optional.of(PLAN_FRAGMENT), ImmutableMap.of(), splitAssignments, outputBuffers, ImmutableMap.of(), false);
+    }
+
+    private static class NoConnectorServicesProvider
+            implements ConnectorServicesProvider
+    {
+        @Override
+        public void loadInitialCatalogs() {}
+
+        @Override
+        public void ensureCatalogsLoaded(List<CatalogProperties> catalogs) {}
+
+        @Override
+        public PrunableState getPrunableState()
+        {
+            return PrunableState.empty();
+        }
+
+        @Override
+        public void pruneCatalogs(PrunableState prunableState, Set<CatalogHandle> catalogsInUse)
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public ConnectorServices getConnectorServices(CatalogHandle catalogHandle)
+        {
+            throw new UnsupportedOperationException();
+        }
     }
 }

@@ -35,6 +35,8 @@ import io.airlift.units.DataSize;
 import io.trino.Session;
 import io.trino.SystemSessionProperties;
 import io.trino.cache.NonEvictableCache;
+import io.trino.connector.CatalogHandle;
+import io.trino.connector.ConnectorServicesProvider;
 import io.trino.exchange.ExchangeEncryptionKey;
 import io.trino.exchange.ExchangeManagerRegistry;
 import io.trino.execution.DynamicFilterConfig;
@@ -51,6 +53,7 @@ import io.trino.metadata.TableExecuteHandle;
 import io.trino.metadata.TableHandle;
 import io.trino.operator.AggregationOperator.AggregationOperatorFactory;
 import io.trino.operator.AssignUniqueIdOperator;
+import io.trino.operator.BloomFilterOptions;
 import io.trino.operator.DevNullOperator.DevNullOperatorFactory;
 import io.trino.operator.DirectExchangeClientSupplier;
 import io.trino.operator.DistinctLimitOperator.DistinctLimitOperatorFactory;
@@ -187,6 +190,7 @@ import io.trino.spi.function.WindowAccumulator;
 import io.trino.spi.function.WindowFunction;
 import io.trino.spi.function.WindowFunctionSupplier;
 import io.trino.spi.function.table.TableFunctionProcessorProvider;
+import io.trino.spi.predicate.BloomFilterKind;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.NullableValue;
 import io.trino.spi.spool.SpoolingManager;
@@ -292,6 +296,7 @@ import java.util.AbstractMap.SimpleEntry;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -335,6 +340,8 @@ import static io.trino.SystemSessionProperties.getWriterScalingMinDataProcessed;
 import static io.trino.SystemSessionProperties.isAdaptiveFilterReorderingEnabled;
 import static io.trino.SystemSessionProperties.isAdaptivePartialAggregationEnabled;
 import static io.trino.SystemSessionProperties.isColumnarFilterEvaluationEnabled;
+import static io.trino.SystemSessionProperties.isDynamicFilteringBloomFilterEnabled;
+import static io.trino.SystemSessionProperties.isDynamicRowFilteringBloomFilterEnabled;
 import static io.trino.SystemSessionProperties.isEnableDynamicRowFiltering;
 import static io.trino.SystemSessionProperties.isForceSpillingOperator;
 import static io.trino.SystemSessionProperties.isSpillEnabled;
@@ -414,9 +421,15 @@ public class LocalExecutionPlanner
 {
     private static final Logger log = Logger.get(LocalExecutionPlanner.class);
 
+    /**
+     * Bloom filter implementation the engine collects when no connector expressed a preference.
+     */
+    private static final BloomFilterKind ENGINE_BLOOM_FILTER_KIND = BloomFilterKind.DATASKETCHES;
+
     private final PlannerContext plannerContext;
     private final Metadata metadata;
     private final Optional<ExplainAnalyzeContext> explainAnalyzeContext;
+    private final ConnectorServicesProvider connectorServicesProvider;
     private final PageSourceManager pageSourceManager;
     private final IndexManager indexManager;
     private final PartitionFunctionProvider partitionFunctionProvider;
@@ -447,6 +460,8 @@ public class LocalExecutionPlanner
     private final int partitionedRangeRowLimitPerDriver;
     private final DataSize maxSizePerOperator;
     private final DataSize partitionedMaxSizePerOperator;
+    private final long bloomFilterExpectedDistinctValues;
+    private final double bloomFilterFalsePositiveProbability;
     private final BlockTypeOperators blockTypeOperators;
     private final TypeOperators typeOperators;
     private final NullSafeHashCompiler hashCompiler;
@@ -467,6 +482,7 @@ public class LocalExecutionPlanner
     public LocalExecutionPlanner(
             PlannerContext plannerContext,
             Optional<ExplainAnalyzeContext> explainAnalyzeContext,
+            ConnectorServicesProvider connectorServicesProvider,
             PageSourceManager pageSourceManager,
             IndexManager indexManager,
             PartitionFunctionProvider partitionFunctionProvider,
@@ -498,6 +514,7 @@ public class LocalExecutionPlanner
         this.plannerContext = requireNonNull(plannerContext, "plannerContext is null");
         this.metadata = plannerContext.getMetadata();
         this.explainAnalyzeContext = requireNonNull(explainAnalyzeContext, "explainAnalyzeContext is null");
+        this.connectorServicesProvider = requireNonNull(connectorServicesProvider, "connectorServicesProvider is null");
         this.pageSourceManager = requireNonNull(pageSourceManager, "pageSourceManager is null");
         this.indexManager = requireNonNull(indexManager, "indexManager is null");
         this.partitionFunctionProvider = requireNonNull(partitionFunctionProvider, "partitionFunctionProvider is null");
@@ -527,6 +544,8 @@ public class LocalExecutionPlanner
         this.partitionedRangeRowLimitPerDriver = dynamicFilterConfig.getPartitionedRangeRowLimitPerDriver();
         this.maxSizePerOperator = dynamicFilterConfig.getMaxSizePerOperator();
         this.partitionedMaxSizePerOperator = dynamicFilterConfig.getPartitionedMaxSizePerOperator();
+        this.bloomFilterExpectedDistinctValues = dynamicFilterConfig.getBloomFilterExpectedDistinctValues();
+        this.bloomFilterFalsePositiveProbability = dynamicFilterConfig.getBloomFilterFalsePositiveProbability();
         this.partitionedMaxDistinctValuesPerDriver = dynamicFilterConfig.getPartitionedMaxDistinctValuesPerDriver();
         this.blockTypeOperators = requireNonNull(blockTypeOperators, "blockTypeOperators is null");
         this.typeOperators = requireNonNull(typeOperators, "typeOperators is null");
@@ -2104,7 +2123,8 @@ public class LocalExecutionPlanner
                             ((TableScanNode) sourceNode).getAssignments(),
                             sourceLayout,
                             getDynamicRowFilterSelectivityThreshold(session),
-                            filterReorderingEnabled));
+                            filterReorderingEnabled,
+                            isDynamicRowFilteringBloomFilterEnabled(session)));
                 }
                 Function<DynamicFilter, PageProcessor> pageProcessor = expressionCompiler.compilePageProcessor(
                         getCharVarcharCoercion(session),
@@ -2713,6 +2733,7 @@ public class LocalExecutionPlanner
                         operatorId,
                         localDynamicFilter.get(),
                         node,
+                        createBloomFilterOptions(node.getLeft()),
                         partitioned,
                         buildContext.getDriverInstanceCount().orElse(1) == 1,
                         buildSource);
@@ -2948,6 +2969,7 @@ public class LocalExecutionPlanner
                         operatorId,
                         localDynamicFilter.get(),
                         node,
+                        createBloomFilterOptions(node.getLeft()),
                         partitioned,
                         buildContext.getDriverInstanceCount().orElse(1) == 1,
                         buildSource);
@@ -3105,6 +3127,8 @@ public class LocalExecutionPlanner
                     context.getNextOperatorId(),
                     dynamicFilterSourceConsumer,
                     node,
+                    // the probe side is in another fragment, so the consuming connector is unknown here
+                    Optional.empty(),
                     false,
                     false,
                     source);
@@ -3114,6 +3138,7 @@ public class LocalExecutionPlanner
                 int operatorId,
                 LocalDynamicFilterConsumer dynamicFilter,
                 PlanNode node,
+                Optional<BloomFilterOptions> bloomFilterOptions,
                 boolean partitioned,
                 boolean isBuildSideSingle,
                 PhysicalOperation buildSource)
@@ -3136,9 +3161,38 @@ public class LocalExecutionPlanner
                             multipleIf(getDynamicFilteringMaxDistinctValuesPerDriver(partitioned), taskConcurrency, isBuildSideSingle),
                             multipleIf(getDynamicFilteringMaxSizePerDriver(partitioned), taskConcurrency, isBuildSideSingle),
                             multipleIf(getDynamicFilteringRangeRowLimitPerDriver(partitioned), taskConcurrency, isBuildSideSingle),
+                            bloomFilterOptions,
                             typeOperators),
                     buildSource.getLayout(),
                     buildSource);
+        }
+
+        /**
+         * Resolves the bloom filter implementation to collect for a dynamic filter, by asking the connectors of the
+         * probe side table scans which implementations they can read. When the engine filters rows with the bloom
+         * filter itself it is a consumer too, and falls back to its own implementation. Returns empty when the feature
+         * is disabled or when the consumers do not agree on an implementation, in which case the dynamic filter
+         * degrades to a min/max range as it does today.
+         */
+        private Optional<BloomFilterOptions> createBloomFilterOptions(PlanNode probeSource)
+        {
+            if (!isDynamicFilteringBloomFilterEnabled(session)) {
+                return Optional.empty();
+            }
+
+            Set<BloomFilterKind> supportedKinds = EnumSet.allOf(BloomFilterKind.class);
+            for (PlanNode tableScan : searchFrom(probeSource).whereIsInstanceOfAny(TableScanNode.class).findAll()) {
+                CatalogHandle catalogHandle = ((TableScanNode) tableScan).getTable().catalogHandle();
+                supportedKinds.retainAll(connectorServicesProvider.getConnectorServices(catalogHandle).getSupportedDynamicFilterBloomFilterKinds());
+            }
+            if (supportedKinds.isEmpty() && isDynamicRowFilteringBloomFilterEnabled(session)) {
+                // the engine filters rows with the bloom filter itself, and reads every implementation it builds
+                supportedKinds = EnumSet.of(ENGINE_BLOOM_FILTER_KIND);
+            }
+
+            return supportedKinds.stream()
+                    .findFirst()
+                    .map(kind -> new BloomFilterOptions(kind, bloomFilterExpectedDistinctValues, bloomFilterFalsePositiveProbability));
         }
 
         private int multipleIf(int value, int multiplier, boolean shouldMultiply)
@@ -3259,6 +3313,7 @@ public class LocalExecutionPlanner
                                 getDynamicFilteringMaxDistinctValuesPerDriver(partitioned),
                                 getDynamicFilteringMaxSizePerDriver(partitioned),
                                 getDynamicFilteringRangeRowLimitPerDriver(partitioned),
+                                createBloomFilterOptions(node.getSource()),
                                 typeOperators),
                         buildSource.getLayout(),
                         buildSource);

@@ -47,6 +47,15 @@
         </dependency>
 
         <dependency>
+            <groupId>org.apache.datasketches</groupId>
+            <artifactId>datasketches-java</artifactId>
+            <version>${dep.datasketches.version}</version>
+            <!-- Used by DataSketchesBloomFilter, which always runs in the engine class loader. Optional, so that
+                 plugins are free to bundle their own version. The engine gets it from trino-main. -->
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
             <groupId>io.opentelemetry</groupId>
             <artifactId>opentelemetry-api-incubator</artifactId>
             <scope>runtime</scope>
@@ -235,6 +244,19 @@
                                     </old>
                                 </item>
                                 <!-- Backwards incompatible changes since the previous release -->
+                                <item>
+                                    <code>java.annotation.removed</code>
+                                    <old>method io.trino.spi.predicate.Domain io.trino.spi.predicate.Domain::create(io.trino.spi.predicate.ValueSet, boolean)</old>
+                                    <annotationType>com.fasterxml.jackson.annotation.JsonCreator</annotationType>
+                                    <justification>Domain gained an optional bloom filter, so the JSON creator moved to the overload which accepts it. The method itself is unchanged.</justification>
+                                </item>
+                                <item>
+                                    <regex>true</regex>
+                                    <code>java.annotation.removed</code>
+                                    <old>parameter io.trino.spi.predicate.Domain io.trino.spi.predicate.Domain::create\(.*\)</old>
+                                    <annotationType>com.fasterxml.jackson.annotation.JsonProperty</annotationType>
+                                    <justification>Domain gained an optional bloom filter, so the JSON creator moved to the overload which accepts it. The method itself is unchanged.</justification>
+                                </item>
                                 <item>
                                     <code>java.method.returnTypeChanged</code>
                                     <old>method io.trino.spi.block.DictionaryBlock io.trino.spi.block.DictionaryBlock::compact()</old>

@@ -28,6 +28,7 @@ import io.trino.sql.planner.plan.PlanNodeId;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Verify.verify;
@@ -39,7 +40,8 @@ import static java.util.stream.Collectors.toSet;
  * This operator acts as a simple "pass-through" pipe, while saving a summary of input pages.
  * The collected values are used for creating a run-time filtering constraint (for probe-side table scan in an inner join).
  * We record all values for the run-time filter only for small build-side pages (which should be the case when using "broadcast" join).
- * For large inputs on the build side, we can optionally record the min and max values per channel for orderable types (except Double and Real).
+ * For large inputs on the build side, we can optionally record the min and max values per channel for orderable types (except Double and Real),
+ * and, when the consuming connector supports it, a bloom filter over the values of each channel.
  */
 public class DynamicFilterSourceOperator
         implements Operator
@@ -56,6 +58,7 @@ public class DynamicFilterSourceOperator
         private final int maxDistinctValues;
         private final DataSize maxFilterSize;
         private final int minMaxCollectionLimit;
+        private final Optional<BloomFilterOptions> bloomFilterOptions;
         private final TypeOperators typeOperators;
 
         private boolean closed;
@@ -69,6 +72,7 @@ public class DynamicFilterSourceOperator
                 int maxDistinctValues,
                 DataSize maxFilterSize,
                 int minMaxCollectionLimit,
+                Optional<BloomFilterOptions> bloomFilterOptions,
                 TypeOperators typeOperators)
         {
             this.operatorId = operatorId;
@@ -82,6 +86,7 @@ public class DynamicFilterSourceOperator
             this.maxDistinctValues = maxDistinctValues;
             this.maxFilterSize = maxFilterSize;
             this.minMaxCollectionLimit = minMaxCollectionLimit;
+            this.bloomFilterOptions = requireNonNull(bloomFilterOptions, "bloomFilterOptions is null");
             this.typeOperators = requireNonNull(typeOperators, "typeOperators is null");
         }
 
@@ -99,6 +104,7 @@ public class DynamicFilterSourceOperator
                         maxDistinctValues,
                         maxFilterSize,
                         minMaxCollectionLimit,
+                        bloomFilterOptions,
                         typeOperators);
             }
             // Return a pass-through operator which adds little overhead
@@ -145,6 +151,7 @@ public class DynamicFilterSourceOperator
                     maxDistinctValues,
                     maxFilterSize,
                     minMaxCollectionLimit,
+                    bloomFilterOptions,
                     typeOperators);
         }
     }
@@ -168,6 +175,7 @@ public class DynamicFilterSourceOperator
             int maxDistinctValues,
             DataSize maxFilterSize,
             int minMaxCollectionLimit,
+            Optional<BloomFilterOptions> bloomFilterOptions,
             TypeOperators typeOperators)
     {
         this.context = requireNonNull(context, "context is null");
@@ -183,6 +191,7 @@ public class DynamicFilterSourceOperator
                         maxDistinctValues,
                         maxFilterSize,
                         minMaxCollectionLimit > 0,
+                        bloomFilterOptions,
                         this::finishDomainCollectionIfNecessary,
                         typeOperators))
                 .toArray(JoinDomainBuilder[]::new);
